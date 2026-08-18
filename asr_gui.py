@@ -2,9 +2,12 @@ import logging
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 import webbrowser
+
+import imageio_ffmpeg
 
 # FIX: 修复中文路径报错 https://github.com/WEIFENG2333/AsrTools/issues/18  设置QT_QPA_PLATFORM_PLUGIN_PATH 
 plugin_path = os.path.join(sys.prefix, 'Lib', 'site-packages', 'PyQt5', 'Qt5', 'plugins')
@@ -19,6 +22,7 @@ from qfluentwidgets import (ComboBox, PushButton, LineEdit, TableWidget, FluentI
                             Action, RoundMenu, InfoBar, InfoBarPosition,
                             FluentWindow, BodyLabel, MessageBox)
 
+from bk_asr.WhisperASR import WhisperASR, list_whisper_models, get_whisper_models_dir
 from bk_asr.BcutASR import BcutASR
 from bk_asr.JianYingASR import JianYingASR
 from bk_asr.KuaiShouASR import KuaiShouASR
@@ -30,6 +34,24 @@ logging.basicConfig(
 )
 
 
+def ensure_ffmpeg_available() -> str:
+    """获取可用的 ffmpeg 执行文件路径并设置环境变量"""
+    if shutil.which("ffmpeg") is not None:
+        return "ffmpeg"
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+        if not os.path.exists(target_ffmpeg):
+            shutil.copyfile(ffmpeg_exe, target_ffmpeg)
+        if ffmpeg_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        return target_ffmpeg
+    except Exception as e:
+        logging.warning(f"获取 ffmpeg 失败: {e}")
+        return "ffmpeg"
+
+
 class WorkerSignals(QObject):
     finished = Signal(str, str)
     errno = Signal(str, str)
@@ -37,11 +59,12 @@ class WorkerSignals(QObject):
 
 class ASRWorker(QRunnable):
     """ASR处理工作线程"""
-    def __init__(self, file_path, asr_engine, export_format):
+    def __init__(self, file_path, asr_engine, export_format, whisper_model=None):
         super().__init__()
         self.file_path = file_path
         self.asr_engine = asr_engine
         self.export_format = export_format
+        self.whisper_model = whisper_model
         self.signals = WorkerSignals()
 
         self.audio_path = None
@@ -51,30 +74,29 @@ class ASRWorker(QRunnable):
         try:
             use_cache = True
             
-            # 检查文件类型,如果不是音频则转换
-            logging.info("[+]正在进ffmpeg转换")
-            audio_exts = ['.mp3', '.wav']
+            # 检查文件类型,如果不是音频则通过 ffmpeg 提取 mp3 音频
+            logging.info("[+] 正在检查文件类型并准备音频")
+            audio_exts = ['.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac', '.wma']
             if not any(self.file_path.lower().endswith(ext) for ext in audio_exts):
+                logging.info(f"[+] 正在使用 ffmpeg 从视频中抽取音频: {self.file_path}")
                 temp_audio = self.file_path.rsplit(".", 1)[0] + ".mp3"
                 if not video2audio(self.file_path, temp_audio):
-                    raise Exception("音频转换失败，确保安装ffmpeg")
+                    raise Exception("音频转换失败，确保 ffmpeg 正常工作")
                 self.audio_path = temp_audio
             else:
                 self.audio_path = self.file_path
             
             # 根据选择的 ASR 引擎实例化相应的类
-            if self.asr_engine == 'B 接口':
+            if 'whisper' in self.asr_engine.lower():
+                asr = WhisperASR(self.audio_path, model_path=self.whisper_model, use_cache=use_cache)
+            elif self.asr_engine == 'B 接口':
                 asr = BcutASR(self.audio_path, use_cache=use_cache)
             elif self.asr_engine == 'J 接口':
                 asr = JianYingASR(self.audio_path, use_cache=use_cache)
             elif self.asr_engine == 'K 接口':
                 asr = KuaiShouASR(self.audio_path, use_cache=use_cache)
-            elif self.asr_engine == 'Whisper':
-                # from bk_asr.WhisperASR import WhisperASR
-                # asr = WhisperASR(self.file_path, use_cache=use_cache)
-                raise NotImplementedError("WhisperASR 暂未实现")
             else:
-                raise ValueError(f"未知的 ASR 引擎: {self.asr_engine}")
+                asr = WhisperASR(self.audio_path, model_path=self.whisper_model, use_cache=use_cache)
 
             logging.info(f"开始处理文件: {self.file_path} 使用引擎: {self.asr_engine}")
             result = asr.run()
@@ -87,6 +109,8 @@ class ASRWorker(QRunnable):
                 result_text = result.to_ass()
             elif save_ext == 'txt':
                 result_text = result.to_txt()
+            else:
+                result_text = result.to_srt()
                 
             logging.info(f"完成处理文件: {self.file_path} 使用引擎: {self.asr_engine}")
             save_path = self.file_path.rsplit(".", 1)[0] + "." + save_ext
@@ -139,18 +163,37 @@ class ASRWidget(QWidget):
 
         # ASR引擎选择区域
         engine_layout = QHBoxLayout()
-        engine_label = BodyLabel("选择接口:", self)
-        engine_label.setFixedWidth(70)
+        engine_label = BodyLabel("选择引擎:", self)
+        engine_label.setFixedWidth(85)
         self.combo_box = ComboBox(self)
-        self.combo_box.addItems(['B 接口', 'J 接口', 'K 接口', 'Whisper'])
+        self.combo_box.addItems(['Whisper.cpp (本地)', 'J 接口', 'B 接口', 'K 接口'])
+        self.combo_box.currentTextChanged.connect(self.on_engine_changed)
         engine_layout.addWidget(engine_label)
         engine_layout.addWidget(self.combo_box)
         layout.addLayout(engine_layout)
 
+        # Whisper 模型选择区域 (读取 resources\whisper 目录)
+        self.model_layout = QHBoxLayout()
+        self.model_label = BodyLabel("Whisper模型:", self)
+        self.model_label.setFixedWidth(85)
+        self.model_combo = ComboBox(self)
+        self.refresh_model_btn = PushButton("刷新模型", self)
+        self.refresh_model_btn.setFixedWidth(80)
+        self.refresh_model_btn.clicked.connect(self.refresh_whisper_models)
+        self.open_model_dir_btn = PushButton("打开模型目录", self)
+        self.open_model_dir_btn.setFixedWidth(100)
+        self.open_model_dir_btn.clicked.connect(self.open_models_directory)
+
+        self.model_layout.addWidget(self.model_label)
+        self.model_layout.addWidget(self.model_combo)
+        self.model_layout.addWidget(self.refresh_model_btn)
+        self.model_layout.addWidget(self.open_model_dir_btn)
+        layout.addLayout(self.model_layout)
+
         # 导出格式选择区域 
         format_layout = QHBoxLayout()
         format_label = BodyLabel("导出格式:", self)
-        format_label.setFixedWidth(70)
+        format_label.setFixedWidth(85)
         self.format_combo = ComboBox(self)
         self.format_combo.addItems(['SRT', 'TXT', 'ASS'])
         format_layout.addWidget(format_label)
@@ -190,11 +233,51 @@ class ASRWidget(QWidget):
         layout.addWidget(self.process_button)
 
         self.setAcceptDrops(True)
+        self.refresh_whisper_models()
+
+    def on_engine_changed(self, engine_text):
+        is_whisper = 'whisper' in engine_text.lower()
+        self.model_label.setEnabled(is_whisper)
+        self.model_combo.setEnabled(is_whisper)
+        self.refresh_model_btn.setEnabled(is_whisper)
+        self.open_model_dir_btn.setEnabled(is_whisper)
+
+    def refresh_whisper_models(self):
+        """刷新 resources/whisper 目录中的模型文件"""
+        models = list_whisper_models()
+        self.model_combo.clear()
+        if models:
+            self.model_combo.addItems(models)
+            if "ggml-base.bin" in models:
+                self.model_combo.setCurrentText("ggml-base.bin")
+        else:
+            self.model_combo.addItem("未检测到模型 (请放入 resources/whisper)")
+
+    def open_models_directory(self):
+        """打开 resources/whisper 文件夹，方便用户放置新模型"""
+        models_dir = get_whisper_models_dir()
+        try:
+            if platform.system() == "Windows":
+                os.startfile(models_dir)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", models_dir])
+            else:
+                subprocess.Popen(["xdg-open", models_dir])
+        except Exception as e:
+            InfoBar.error(
+                title='无法打开目录',
+                content=str(e),
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+                parent=self
+            )
 
     def select_file(self):
         """选择文件对话框"""
         files, _ = QFileDialog.getOpenFileNames(self, "选择音频或视频文件", "",
-                                                "Media Files (*.mp3 *.wav *.ogg *.mp4 *.avi *.mov *.ts)")
+                                                "Media Files (*.mp3 *.wav *.ogg *.flac *.m4a *.mp4 *.avi *.mov *.ts *.mkv *.flv *.webm)")
         for file in files:
             self.add_file_to_table(file)
         self.update_start_button_state()
@@ -257,8 +340,6 @@ class ASRWidget(QWidget):
                 worker = self.workers[file_path]
                 worker.signals.finished.disconnect(self.update_table)
                 worker.signals.errno.disconnect(self.handle_error)
-                # QThreadPool 不支持直接终止线程，通常需要设计任务可中断
-                # 这里仅移除引用
                 self.workers.pop(file_path, None)
             self.table.removeRow(current_row)
             self.update_start_button_state()
@@ -332,7 +413,8 @@ class ASRWidget(QWidget):
         """处理单个文件"""
         selected_engine = self.combo_box.currentText()
         selected_format = self.format_combo.currentText()
-        worker = ASRWorker(file_path, selected_engine, selected_format)
+        selected_model = self.model_combo.currentText() if self.model_combo.isEnabled() else None
+        worker = ASRWorker(file_path, selected_engine, selected_format, whisper_model=selected_model)
         worker.signals.finished.connect(self.update_table)
         worker.signals.errno.connect(self.handle_error)
         self.thread_pool.start(worker)
@@ -436,21 +518,19 @@ class InfoWidget(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        # GitHub URL 和仓库描述
         GITHUB_URL = "https://github.com/WEIFENG2333/AsrTools"
         REPO_DESCRIPTION = """
-    🚀 无需复杂配置：无需 GPU 和繁琐的本地配置，小白也能轻松使用。
+    🚀 本地离线高精准：基于 Whisper.cpp 本地模型进行语音识别，支持自由更换 resources/whisper 模型文件。
     🖥️ 高颜值界面：基于 PyQt5 和 qfluentwidgets，界面美观且用户友好。
-    ⚡ 效率超人：多线程并发 + 批量处理，文字转换快如闪电。
-    📄 多格式支持：支持生成 .srt 和 .txt 字幕文件，满足不同需求。
+    ⚡ 效率超人：多线程并发 + 批量处理，视频自动抽取音频并极速转换。
+    📄 多格式支持：支持生成 .srt、.txt、.ass 字幕文件，满足不同需求。
         """
         
         main_layout = QVBoxLayout(self)
         main_layout.setAlignment(Qt.AlignTop)
-        # main_layout.setSpacing(50)
 
         # 标题
-        title_label = BodyLabel("  ASRTools", self)
+        title_label = BodyLabel("  ASRTools (Whisper.cpp)", self)
         title_label.setFont(QFont("Segoe UI", 30, QFont.Bold))
         title_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title_label)
@@ -481,11 +561,11 @@ class MainWindow(FluentWindow):
 
         # 个人信息界面
         self.info_widget = InfoWidget()
-        self.info_widget.setObjectName("info")  # 设置对象名称
+        self.info_widget.setObjectName("info")
         self.addSubInterface(self.info_widget, FIF.GITHUB, 'About')
 
         self.navigationInterface.setExpandWidth(200)
-        self.resize(800, 600)
+        self.resize(850, 620)
 
         self.update_checker = UpdateCheckerThread(self)
         self.update_checker.msg.connect(self.show_msg)
@@ -499,14 +579,15 @@ class MainWindow(FluentWindow):
             sys.exit(0)
 
 def video2audio(input_file: str, output: str = "") -> bool:
-    """使用ffmpeg将视频转换为音频"""
-    # 创建output目录
+    """使用 ffmpeg 将视频转换为音频"""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output = str(output)
 
+    ffmpeg_bin = ensure_ffmpeg_available()
+
     cmd = [
-        'ffmpeg',
+        ffmpeg_bin,
         '-i', input_file,
         '-ac', '1',
         '-f', 'mp3',
@@ -529,7 +610,6 @@ def start():
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
     app = QApplication(sys.argv)
-    # setTheme(Theme.DARK)  # 如果需要深色主题，取消注释此行
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
