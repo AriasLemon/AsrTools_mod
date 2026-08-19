@@ -1,6 +1,6 @@
 # 🎤 AsrTools
 
-基于AsrTools（https://github.com/WEIFENG2333/AsrTools）修改
+基于AsrTools修改
 - 修复J接口
 - 加入Whisper本地模式
 
