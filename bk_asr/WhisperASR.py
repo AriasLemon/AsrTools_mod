@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from typing import List, Optional, Union
 
 import imageio_ffmpeg
@@ -11,21 +12,26 @@ from pywhispercpp.model import Model
 from .ASRData import ASRDataSeg
 from .BaseASR import BaseASR
 
+_ffmpeg_lock = threading.Lock()
+
 
 def _ensure_ffmpeg_in_path():
     """确保 ffmpeg 在系统环境变量 PATH 中，供 pywhispercpp 或 subprocess 使用"""
     if shutil.which("ffmpeg") is not None:
         return
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
-        if not os.path.exists(target_ffmpeg):
-            shutil.copyfile(ffmpeg_exe, target_ffmpeg)
-        if ffmpeg_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    except Exception as e:
-        logging.warning(f"无法自动配置 ffmpeg: {e}")
+    with _ffmpeg_lock:
+        if shutil.which("ffmpeg") is not None:
+            return
+        try:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+            if not os.path.exists(target_ffmpeg):
+                shutil.copyfile(ffmpeg_exe, target_ffmpeg)
+            if ffmpeg_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        except Exception as e:
+            logging.warning(f"无法自动配置 ffmpeg: {e}")
 
 
 def get_whisper_models_dir() -> str:
@@ -106,6 +112,7 @@ class WhisperASR(BaseASR):
     # 全局模型缓存，避免每次识别重复加载相同模型
     _model_instance = None
     _loaded_model_path = None
+    _lock = threading.Lock()
 
     def __init__(
         self,
@@ -127,18 +134,23 @@ class WhisperASR(BaseASR):
         self._init_model()
 
     def _init_model(self):
-        """初始化或复用已加载的 Whisper 模型"""
-        if (
-            WhisperASR._model_instance is None
-            or WhisperASR._loaded_model_path != self.model_path
-        ):
-            logging.info(f"正在从 resources/whisper 加载本地模型: {self.model_path}")
-            WhisperASR._model_instance = Model(
-                self.model_path,
-                n_threads=self.n_threads,
-            )
-            WhisperASR._loaded_model_path = self.model_path
-        self.model = WhisperASR._model_instance
+        """初始化或复用已加载的 Whisper 模型（线程安全）"""
+        with WhisperASR._lock:
+            if (
+                WhisperASR._model_instance is None
+                or WhisperASR._loaded_model_path != self.model_path
+            ):
+                logging.info(f"正在从 resources/whisper 加载本地模型: {self.model_path}")
+                WhisperASR._model_instance = Model(
+                    self.model_path,
+                    n_threads=self.n_threads,
+                    print_progress=False,
+                    print_realtime=False,
+                    print_timestamps=False,
+                    redirect_whispercpp_logs_to=None,
+                )
+                WhisperASR._loaded_model_path = self.model_path
+            self.model = WhisperASR._model_instance
 
     def _get_key(self) -> str:
         model_name = os.path.basename(self.model_path)
@@ -159,11 +171,16 @@ class WhisperASR(BaseASR):
 
         try:
             logging.info(f"开始使用 Whisper.cpp 本地转写: {target_path} (模型: {os.path.basename(self.model_path)})")
-            segments = self.model.transcribe(
-                target_path,
-                language=self.language,
-                initial_prompt=self.initial_prompt,
-            )
+            transcribe_kwargs = {"language": self.language}
+            if self.initial_prompt:
+                transcribe_kwargs["initial_prompt"] = str(self.initial_prompt)
+
+            # whisper.cpp C++ 底层上下文并非线程安全，必须加锁串行执行转写，避免多任务并发引发 0xC0000005 内存访问冲突崩溃闪退
+            with WhisperASR._lock:
+                segments = self.model.transcribe(
+                    target_path,
+                    **transcribe_kwargs,
+                )
 
             results = []
             for seg in segments:

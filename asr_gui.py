@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import webbrowser
 
 import imageio_ffmpeg
@@ -33,23 +34,28 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+_ffmpeg_gui_lock = threading.Lock()
+
 
 def ensure_ffmpeg_available() -> str:
-    """获取可用的 ffmpeg 执行文件路径并设置环境变量"""
+    """获取可用的 ffmpeg 执行文件路径并设置环境变量（线程安全）"""
     if shutil.which("ffmpeg") is not None:
         return "ffmpeg"
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-        target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
-        if not os.path.exists(target_ffmpeg):
-            shutil.copyfile(ffmpeg_exe, target_ffmpeg)
-        if ffmpeg_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-        return target_ffmpeg
-    except Exception as e:
-        logging.warning(f"获取 ffmpeg 失败: {e}")
-        return "ffmpeg"
+    with _ffmpeg_gui_lock:
+        if shutil.which("ffmpeg") is not None:
+            return "ffmpeg"
+        try:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            target_ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+            if not os.path.exists(target_ffmpeg):
+                shutil.copyfile(ffmpeg_exe, target_ffmpeg)
+            if ffmpeg_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+            return target_ffmpeg
+        except Exception as e:
+            logging.warning(f"获取 ffmpeg 失败: {e}")
+            return "ffmpeg"
 
 
 class WorkerSignals(QObject):
@@ -61,6 +67,8 @@ class ASRWorker(QRunnable):
     """ASR处理工作线程"""
     def __init__(self, file_path, asr_engine, export_format, whisper_model=None):
         super().__init__()
+        # 禁用 QThreadPool 对 QRunnable 的自动析构，防止 Python 引用与 Qt 跨线程信号派发冲突导致崩溃
+        self.setAutoDelete(False)
         self.file_path = file_path
         self.asr_engine = asr_engine
         self.export_format = export_format
@@ -81,7 +89,9 @@ class ASRWorker(QRunnable):
                 logging.info(f"[+] 正在使用 ffmpeg 从视频中抽取音频: {self.file_path}")
                 temp_audio = self.file_path.rsplit(".", 1)[0] + ".mp3"
                 if not video2audio(self.file_path, temp_audio):
-                    raise Exception("音频转换失败，确保 ffmpeg 正常工作")
+                    raise Exception("视频音频抽取失败，请确保视频包含有效音频轨且 ffmpeg 正常工作")
+                if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) == 0:
+                    raise Exception("提取生成的音频文件为空或无效")
                 self.audio_path = temp_audio
             else:
                 self.audio_path = self.file_path
@@ -579,27 +589,52 @@ class MainWindow(FluentWindow):
             sys.exit(0)
 
 def video2audio(input_file: str, output: str = "") -> bool:
-    """使用 ffmpeg 将视频转换为音频"""
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output = str(output)
+    """使用 ffmpeg 将视频转换为音频（健壮防闪退版）"""
+    try:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logging.warning(f"创建目标目录失败，尝试使用临时目录: {e}")
+        output = os.path.join(tempfile.gettempdir(), Path(output).name)
 
+    output = str(output)
     ffmpeg_bin = ensure_ffmpeg_available()
 
+    # -vn: 禁用视频流解码（大幅降低CPU/内存开销，彻底避免 4K/8K 或异常视频编码导致解码崩溃）
+    # -sn: 禁用字幕流解码
+    # -ac 1: 转换单声道
+    # -f mp3: 输出 mp3
     cmd = [
         ffmpeg_bin,
         '-i', input_file,
+        '-vn',
+        '-sn',
         '-ac', '1',
         '-f', 'mp3',
         '-af', 'aresample=async=1',
         '-y',
         output
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True, encoding='utf-8', errors='replace')
-
-    if result.returncode == 0 and Path(output).is_file():
-        return True
-    else:
+    try:
+        kwargs = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding='utf-8',
+            errors='replace',
+            **kwargs
+        )
+        if result.returncode == 0 and Path(output).is_file() and os.path.getsize(output) > 0:
+            return True
+        else:
+            err_msg = result.stderr.strip()[-500:] if result.stderr else "未知错误"
+            logging.error(f"ffmpeg 音频抽取失败 (返回码 {result.returncode}): {err_msg}")
+            return False
+    except Exception as e:
+        logging.error(f"调用 ffmpeg 异常: {e}")
         return False
 
 def start():
