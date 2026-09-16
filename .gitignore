@@ -1,0 +1,58 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Whisper models (模型文件较大，超出 GitHub 100MB 限制，请用户本地下载放入)
+resources/whisper/*.bin
+!resources/whisper/将Whisper本地模型放在该路径.md
+
+# Local API Keys / Sensitive files
+gemini_key.txt
+.env
+*.key
+
+# Environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ASR Cache
+asr_cache.json

@@ -26,7 +26,7 @@ from qfluentwidgets import (ComboBox, PushButton, LineEdit, TableWidget, FluentI
 from bk_asr.WhisperASR import WhisperASR, list_whisper_models, get_whisper_models_dir
 from bk_asr.BcutASR import BcutASR
 from bk_asr.JianYingASR import JianYingASR
-from bk_asr.KuaiShouASR import KuaiShouASR
+from bk_asr.GeminiASR import GeminiASR
 
 # 设置日志配置
 logging.basicConfig(
@@ -103,8 +103,8 @@ class ASRWorker(QRunnable):
                 asr = BcutASR(self.audio_path, use_cache=use_cache)
             elif self.asr_engine == 'J 接口':
                 asr = JianYingASR(self.audio_path, use_cache=use_cache)
-            elif self.asr_engine == 'K 接口':
-                asr = KuaiShouASR(self.audio_path, use_cache=use_cache)
+            elif self.asr_engine == 'G 接口':
+                asr = GeminiASR(self.audio_path, use_cache=use_cache)
             else:
                 asr = WhisperASR(self.audio_path, model_path=self.whisper_model, use_cache=use_cache)
 
@@ -176,7 +176,7 @@ class ASRWidget(QWidget):
         engine_label = BodyLabel("选择引擎:", self)
         engine_label.setFixedWidth(85)
         self.combo_box = ComboBox(self)
-        self.combo_box.addItems(['Whisper.cpp (本地)', 'J 接口', 'B 接口', 'K 接口'])
+        self.combo_box.addItems(['Whisper.cpp (本地)', 'J 接口', 'B 接口', 'G 接口'])
         self.combo_box.currentTextChanged.connect(self.on_engine_changed)
         engine_layout.addWidget(engine_label)
         engine_layout.addWidget(self.combo_box)

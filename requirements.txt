@@ -3,3 +3,4 @@ imageio-ffmpeg>=0.6.0
 requests
 PyQt5
 PyQt-Fluent-Widgets
+google-genai>=2.0.0
