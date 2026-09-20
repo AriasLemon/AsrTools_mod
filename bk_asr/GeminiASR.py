@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import socket
+import unicodedata
 from typing import Dict, List, Optional, Union
 
 import requests
@@ -56,7 +57,7 @@ class GeminiASR(BaseASR):
         use_cache: bool = False,
         api_key: Optional[str] = None,
         model_name: str = GEMINI_TRANSCRIBE_MODEL,
-        max_chars_per_line: int = 25,
+        max_chars_per_line: int = 18,
     ):
         super().__init__(audio_path, use_cache=use_cache)
         self.api_key = self._resolve_api_key(api_key)
@@ -299,42 +300,123 @@ class GeminiASR(BaseASR):
 
         return "".join(result).strip()
 
-    def _aggregate_words_to_segments(self, words: List[dict]) -> List[ASRDataSeg]:
+    @staticmethod
+    def _clean_subtitle_punctuation(text: str) -> str:
         """
-        聚合词级时间戳为字幕块（SRT段落）：
-        1. 句子语义通顺：依据标点符号（。！？，、；）与语音停顿断句
-        2. 硬性限制：每行文本块严格不超过 max_chars_per_line（默认 25 字）
+        文本块换行处理后，字幕中除了顿号、括号、数学符号和·，其他标点符号换为空格。
+        保留项：
+        - 顿号：、
+        - 括号：()（）[]【】{}｛｝〔〕〈〉《》«»‹›〖〗
+        - 数学符号：+-*/=<>%^~±×÷≠≤≥≈≡‰°√∑∏∫∞＋－×÷＝＜＞％ 以及数字之间的小数点（如 3.14）
+        - ·（间隔号）：·・•●
+        其他所有标点符号均替换为空格，并合并连续空格及去除首尾空格。
         """
-        if not words:
-            return []
+        if not text:
+            return ""
 
-        # 拆分处理过长的单个词（如果单词本身 > max_chars_per_line）
-        normalized_words = []
+        # 1. 保护数字间的点（如 3.14）
+        placeholder = "\uE000"
+        text_protected = re.sub(r'(?<=\d)\.(?=\d)', placeholder, text)
+
+        # 2. 保留标点白名单：顿号、括号、数学符号、·
+        pause_comma = {"、"}
+        brackets = set("()（）[]【】{}｛｝〔〕〈〉《》«»‹›〖〗")
+        math_symbols = set("+-*/=<>%^~±×÷≠≤≥≈≡‰°√∑∏∫∞＋－×÷＝＜＞％")
+        middle_dots = set("·・•●")
+        allowed = pause_comma | brackets | math_symbols | middle_dots
+
+        cleaned_chars = []
+        for ch in text_protected:
+            if ch == placeholder:
+                cleaned_chars.append(".")
+            elif ch.isalnum() or ch.isspace() or ch in allowed:
+                cleaned_chars.append(ch)
+            elif unicodedata.category(ch).startswith("P") or unicodedata.category(ch).startswith("S"):
+                cleaned_chars.append(" ")
+            else:
+                cleaned_chars.append(ch)
+
+        return re.sub(r" +", " ", "".join(cleaned_chars)).strip()
+
+    @staticmethod
+    def _is_period_ended(text: str) -> bool:
+        """判断文本是否以句号结尾（。、｡ 或非小数点的 .）"""
+        if not text:
+            return False
+        if text.endswith("。") or text.endswith("｡"):
+            return True
+        if text.endswith(".") and not re.search(r'\d\.\d?$', text):
+            return True
+        return False
+
+    def _split_words_by_period_and_length(self, words: List[dict]) -> List[dict]:
+        """预处理词列表：若单词内部包含句号，在句号处切分；若单词长度超过 max_chars_per_line，按长度切分"""
+        result = []
         for w in words:
             text = w["text"]
             start_ms = w["start_ms"]
             end_ms = w["end_ms"]
-            if len(text) > self.max_chars_per_line:
-                step = self.max_chars_per_line
-                total_len = len(text)
-                duration = max(end_ms - start_ms, 10)
-                for idx in range(0, total_len, step):
-                    chunk_text = text[idx : idx + step]
-                    chunk_start = start_ms + int(duration * (idx / total_len))
-                    chunk_end = start_ms + int(duration * (min(idx + step, total_len) / total_len))
-                    normalized_words.append({
-                        "text": chunk_text,
-                        "start_ms": chunk_start,
-                        "end_ms": chunk_end,
+            duration = max(end_ms - start_ms, 10)
+
+            # 1. 检查内部句号切分（例如 "逻辑。首先" -> "逻辑。" 与 "首先"）
+            parts = []
+            cur_idx = 0
+            for m in re.finditer(r'(?:[。｡]|(?<!\d)\.(?!\d))', text):
+                end_pos = m.end()
+                if end_pos < len(text):
+                    part_str = text[cur_idx:end_pos]
+                    if part_str:
+                        parts.append(part_str)
+                    cur_idx = end_pos
+            if cur_idx < len(text):
+                parts.append(text[cur_idx:])
+
+            if not parts:
+                parts = [text]
+
+            # 计算切分后的时间戳
+            cur_start = start_ms
+            total_len = len(text)
+            for part in parts:
+                part_duration = int(duration * (len(part) / total_len)) if total_len > 0 else 0
+                part_end = cur_start + part_duration
+
+                # 2. 如果单个分块长度仍然 > max_chars_per_line，进行长度切分
+                if len(part) > self.max_chars_per_line:
+                    step = self.max_chars_per_line
+                    p_len = len(part)
+                    p_dur = max(part_end - cur_start, 10)
+                    for i in range(0, p_len, step):
+                        sub_text = part[i : i + step]
+                        sub_start = cur_start + int(p_dur * (i / p_len))
+                        sub_end = cur_start + int(p_dur * (min(i + step, p_len) / p_len))
+                        result.append({
+                            "text": sub_text,
+                            "start_ms": sub_start,
+                            "end_ms": sub_end,
+                        })
+                else:
+                    result.append({
+                        "text": part,
+                        "start_ms": cur_start,
+                        "end_ms": part_end,
                     })
-            else:
-                normalized_words.append(w)
+                cur_start = part_end
+        return result
+
+    def _aggregate_words_to_segments(self, words: List[dict]) -> List[ASRDataSeg]:
+        """
+        聚合词级时间戳为字幕块（SRT段落）：
+        1. 换行规则：每行最多 18 个字符，超过就换行；遇到句号也换行。
+        2. 标点清洗规则：文本块换行处理后，字幕中除了顿号、括号、数学符号和·，其他标点符号换为空格。
+        """
+        if not words:
+            return []
+
+        normalized_words = self._split_words_by_period_and_length(words)
 
         segments = []
         current_chunk: List[dict] = []
-
-        sentence_enders = ("。", "！", "？", "!", "?", "…")
-        clause_breaks = ("，", "、", "；", ";", "：", ":", ",")
 
         for w in normalized_words:
             if not current_chunk:
@@ -342,35 +424,24 @@ class GeminiASR(BaseASR):
                 continue
 
             last_word = current_chunk[-1]
-            pause_ms = w["start_ms"] - last_word["end_ms"]
 
             candidate_chunk = current_chunk + [w]
             candidate_text = self._format_word_sequence(candidate_chunk)
             candidate_len = len(candidate_text)
 
-            current_text = self._format_word_sequence(current_chunk)
-            current_len = len(current_text)
-
             should_break = False
 
-            # 规则 1：硬性限制，累计长度不能超过 max_chars_per_line
-            if candidate_len > self.max_chars_per_line:
+            # 规则 1：遇到句号换行（前一个词以句号结尾，换到下一行）
+            if self._is_period_ended(last_word["text"]):
                 should_break = True
 
-            # 规则 2：前一词以句末终结符（。！？!?）结尾，且当前块有一定字数（>= 5 字）
-            elif any(last_word["text"].endswith(p) for p in sentence_enders) and current_len >= 5:
-                should_break = True
-
-            # 规则 3：语音停顿长（>= 700ms 且字数 >= 8，或 >= 1200ms）
-            elif (pause_ms >= 700 and current_len >= 8) or pause_ms >= 1200:
-                should_break = True
-
-            # 规则 4：前一词以分句逗号等停顿标点结尾，且当前块字数已经较长（>= 14 字），继续添加易超长
-            elif any(last_word["text"].endswith(p) for p in clause_breaks) and current_len >= 14:
+            # 规则 2：每行最多 18 个字符，超过就换行
+            elif candidate_len > self.max_chars_per_line:
                 should_break = True
 
             if should_break:
-                seg_text = self._format_word_sequence(current_chunk)
+                seg_raw_text = self._format_word_sequence(current_chunk)
+                seg_text = self._clean_subtitle_punctuation(seg_raw_text)
                 seg_start = current_chunk[0]["start_ms"]
                 seg_end = current_chunk[-1]["end_ms"]
                 if seg_text:
@@ -380,7 +451,8 @@ class GeminiASR(BaseASR):
                 current_chunk.append(w)
 
         if current_chunk:
-            seg_text = self._format_word_sequence(current_chunk)
+            seg_raw_text = self._format_word_sequence(current_chunk)
+            seg_text = self._clean_subtitle_punctuation(seg_raw_text)
             seg_start = current_chunk[0]["start_ms"]
             seg_end = current_chunk[-1]["end_ms"]
             if seg_text:

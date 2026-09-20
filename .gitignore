@@ -56,3 +56,4 @@ Thumbs.db
 
 # ASR Cache
 asr_cache.json
+test_gemini_asr.py
